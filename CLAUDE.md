@@ -19,7 +19,11 @@ Multi-page static site on Cloudflare Pages. Single domain, path-based routing.
 - `shared/` — CSS/JS/fonts used by 2+ pages. Create only when real duplication appears.
 - `_headers` — cache rules. `/shared/*` cached for a year; HTML is not cached.
 - `.claude/commands/` — slash commands (e.g. `/new-page`).
-- `docs/` — architecture and onboarding docs (shareable).
+- `docs/` — architecture and onboarding docs (shareable). Tracking flow: `docs/TRACKING.md`.
+- `functions/` — Cloudflare Pages Functions (the tracking stack — see `## Tracking`). `_middleware.js` runs on every page; `tracker.js` is `POST /tracker`; `quiz-response.js` is `POST /quiz-response`; `api/*` are the read-only dashboard endpoints.
+- `migrations/` — D1 schema, applied with `wrangler d1 migrations apply`. Numbered `0001`–`0016` (`0005` intentionally absent).
+- `dash/` — the built-in tracking dashboard, served at `/dash/`. Auth via `?key=<DASH_KEY>`.
+- `wrangler.toml.example` — template for the local-only `wrangler.toml` (gitignored). See `## Tracking` → deploy.
 
 ## Performance defaults (keep these)
 
@@ -29,16 +33,80 @@ Multi-page static site on Cloudflare Pages. Single domain, path-based routing.
 - Use `<link rel="preload">` for the hero image and the above-the-fold font.
 - `<link rel="preconnect">` to any third-party origin (pixels, analytics) before loading its script.
 
+## Tracking
+
+This repo has the **KROB tracking stack** merged in (ported from `gustavokrob/krob-tracking-stack`,
+leads-funnel slice only). It's part of the **same** Cloudflare Pages project that serves the pages —
+do not split it into a separate project; the first-party cookies + edge middleware only work
+same-origin with the landing pages.
+
+**What it does:** the edge middleware (`functions/_middleware.js`) runs on every page request, sets
+400-day first-party cookies (`_krob_sid`, `_fbp`, `_fbc`, `_krob_eid`), captures `fbclid`/`gclid`/UTMs,
+and upserts a `sessions` row. `POST /tracker` (`functions/tracker.js`) fires server-side conversion
+events to Meta CAPI (with SHA-256-hashed PII for Advanced Matching), deduped against the browser pixel
+by `event_id`, and logs non-PageView events to `event_log`. `POST /quiz-response`
+(`functions/quiz-response.js`) persists the `/lp-do-sobral` qualification-quiz answers to `quiz_responses`.
+The dashboard lives at `/dash/?key=<DASH_KEY>` (Leads + Tracking Health tabs are the live ones; the
+revenue/products/attribution tabs are wired but empty — no sales funnel here).
+
+**Events `/lp-do-sobral` fires:** `PageView` (pixel + CAPI, never logged to D1) on load; `Lead`
+(enriched with `em` + `fn`) on form submit; the custom event `Lead31Plus` (also `em` + `fn`) when the
+visitor picks a 31-or-older age band on the quiz's first question; and `POST /quiz-response` at the end
+of the quiz. Other pages (`/captura`, `/vendas`, `/links`) get cookie + `sessions` capture for free via
+the middleware but don't fire pixel events. Sales-side tracking (`/checkout-session`, sales-platform
+webhooks) was deliberately **not** ported — if `/vendas` ever becomes a real checkout page, port the
+sales-page recipe from the source stack.
+
+**GA4 is off.** Meta only. The gtag first-party proxy and GA4 script blocks were not ported. To turn GA4
+on later: set `GA4_MEASUREMENT_ID` + `GA4_API_SECRET`, copy `functions/scripts/[[path]].js` from the
+source stack, and add the gtag `<script>` blocks to the page `<head>`. `tracker.js` already skips GA4
+cleanly when those env vars are unset.
+
+**Hard rules (do not violate):**
+- **Never log `PageView` to `event_log`.** It still fires to Meta — it just doesn't write a D1 row.
+  Enforced in `tracker.js`.
+- **Always use parameterized SQL** (`.bind()`). No string interpolation of user input, ever.
+- **Hash PII before sending to ad platforms.** Email/name get SHA-256-hashed after lowercase+trim
+  in `tracker.js`. Raw PII persists in D1 (`event_log.raw_email`, `quiz_responses.raw_*`) for analysis
+  only — it never leaves this infra.
+- **No secrets in client code or git.** `wrangler.toml`, `.dev.vars*` are gitignored. The Meta CAPI
+  token and `DASH_KEY` live only as Cloudflare Pages environment variables.
+
+**Required Pages environment variables** (Settings → Environment variables → Production):
+`META_PIXEL_ID` (numeric — same value used in the page's `fbq('init', ...)`), `META_ACCESS_TOKEN` (CAPI
+token, encrypt), `DASH_KEY` (random, encrypt — gates `/dash` and `/api/*`). Optional: `META_TEST_EVENT_CODE`
+(routes events to Events Manager → Test Events), `DEFAULT_COUNTRY_CODE` (default `55`), and
+`SYNC_SECRET` + `META_ADS_ACCESS_TOKEN` + `META_ADS_ACCOUNT_ID` (Meta-spend sync — inactive until set
+and an external hourly cron hits `/api/sync/meta-ads`).
+**Required D1 binding:** a D1 database bound as variable name `DB` (the code reads `env.DB`).
+
+**Deploy / D1 setup** (run with `cf-on borkcursos`): `npx wrangler@latest d1 create <name>-db` →
+copy `wrangler.toml.example` to `wrangler.toml` and fill the three `__REPLACE_ME_*__` values (project
+name, db name, `database_id`) → `npx wrangler@latest d1 migrations apply <name>-db --remote` → in the
+Cloudflare dashboard bind the D1 as `DB` and add the env vars above → retry the latest deployment (env
+var / binding changes don't apply to existing deploys). Generate `DASH_KEY` with `openssl rand -hex 32`.
+Page deploys themselves keep happening via `git push` to the connected branch — Cloudflare Pages does
+**not** read `wrangler.toml` at deploy time; it exists only for `wrangler d1` and `wrangler pages dev`.
+
 ## Do not
 
 - Duplicate trackers across pages — when trackers arrive, they live in `shared/scripts/`.
 - Add a bundler, package.json, or framework without asking.
 - Put secrets in client-side code.
 - Rename a launched folder without a matching `_redirects` entry.
+- Log `PageView` to `event_log`, build SQL with string interpolation, or send unhashed PII to ad platforms (see `## Tracking`).
 
 ## Deploy
 
-Cloudflare Pages, single project pointing at repo root. Push to the connected branch.
+Cloudflare Pages, single project pointing at repo root. Push to the connected branch. The same project
+also serves the tracking stack (`functions/`, `migrations/`, `dash/`) — see `## Tracking` for the D1 +
+environment-variable setup that the Pages project needs.
+
+## Cloudflare account (this repo)
+
+This repo always uses the **`borkcursos`** Cloudflare profile. Before running any
+`wrangler` / Cloudflare CLI command in this repo, run `cf-on borkcursos` (verify with
+`cf-status`; `cf-off` when done). Don't use the machine's other Cloudflare profiles here.
 
 ## For Claude: check `origin` before any `git push`
 

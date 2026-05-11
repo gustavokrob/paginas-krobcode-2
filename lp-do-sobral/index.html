@@ -19,10 +19,38 @@
   <link rel="preload" as="style" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800&display=swap">
   <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Barlow:wght@400;500;600;700;800&display=swap">
 
-  <!-- Trackers (preconnect quando entrarem):
-  <link rel="preconnect" href="https://www.googletagmanager.com" crossorigin>
+  <!-- Meta Pixel — preconnect first-party + loader. O CAPI server-side roda via /tracker
+       (functions/tracker.js); o token e o Pixel ID ficam na env var do Pages. O número
+       no fbq('init') abaixo precisa ser igual ao da env var META_PIXEL_ID. -->
   <link rel="preconnect" href="https://connect.facebook.net" crossorigin>
-  -->
+  <script>
+    !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
+    document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    fbq('init', '945469125060300');
+
+    // PageView — dual fire (pixel + CAPI) com event_id compartilhado para dedup.
+    // /tracker NÃO grava PageView em event_log; só dispara o Meta CAPI server-side.
+    (function () {
+      var pvEventId = (crypto.randomUUID && crypto.randomUUID()) ||
+        (Date.now() + '-' + Math.random().toString(36).slice(2));
+      fbq('track', 'PageView', {}, { eventID: pvEventId });
+      fetch('/tracker', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true,
+        body: JSON.stringify({
+          event_name: 'PageView',
+          event_id: pvEventId,
+          event_time: Math.floor(Date.now() / 1000),
+          event_source_url: window.location.href,
+          user_data: {},
+        }),
+      }).catch(function () {});
+    })();
+  </script>
 
   <style>
     *,*::before,*::after { box-sizing: border-box; }
@@ -821,6 +849,16 @@
       var EDUCATION_QUESTION_INDEX = 2;
       var QUALIFYING_EDUCATION = 'Superior completo';
 
+      // Tracking: a 1ª pergunta do quiz é a idade. Se a faixa escolhida for de
+      // 31 anos ou mais, dispara o evento custom Lead31Plus (uma vez só).
+      var AGE_QUESTION_INDEX = 0;
+      var AGE_31_PLUS_BANDS = [
+        'Entre 31 e 35 anos',
+        'Entre 36 e 40 anos',
+        'Entre 41 e 50 anos',
+        'Acima de 50 anos'
+      ];
+
       var form    = document.getElementById('signup');
       var modal   = document.getElementById('quizModal');
       var stepEl  = document.getElementById('quizStep');
@@ -833,9 +871,56 @@
 
       if (!form || !modal) return;
 
-      var current  = 0;
-      var answers  = [];
-      var leadData = {};
+      var current     = 0;
+      var answers     = [];
+      var leadData    = {};
+      var lead31Fired = false;
+
+      // Dispara um evento de conversão: pixel do navegador (dedup por event_id) +
+      // CAPI server-side via /tracker (que hasheia o PII e enriquece com fbp/fbc/UTMs
+      // da session). Não-bloqueante. `isCustom` → fbq('trackCustom', ...).
+      function fireEvent(eventName, isCustom) {
+        var eventId = (crypto.randomUUID && crypto.randomUUID()) ||
+          (Date.now() + '-' + Math.random().toString(36).slice(2));
+        var eventTime = Math.floor(Date.now() / 1000);
+        try {
+          if (window.fbq) {
+            fbq(isCustom ? 'trackCustom' : 'track', eventName, {}, { eventID: eventId });
+          }
+        } catch (_) {}
+        var userData = {};
+        if (leadData.email) userData.em = leadData.email;
+        if (leadData.first_name) userData.fn = leadData.first_name;
+        fetch('/tracker', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          keepalive: true,
+          body: JSON.stringify({
+            event_name: eventName,
+            event_id: eventId,
+            event_time: eventTime,
+            event_source_url: window.location.href,
+            user_data: userData,
+          }),
+        }).catch(function () {});
+      }
+
+      // Persiste a corrida do quiz em D1 (tabela quiz_responses), ligada à session
+      // via cookie _krob_sid. Endpoint: functions/quiz-response.js.
+      function persistQuiz(qualified) {
+        fetch('/quiz-response', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          keepalive: true,
+          body: JSON.stringify({
+            first_name: leadData.first_name || '',
+            email: leadData.email || '',
+            answers: answers,
+            qualified: !!qualified,
+            event_source_url: window.location.href,
+          }),
+        }).catch(function () {});
+      }
 
       function renderQuestion(i) {
         var item = QUESTIONS[i];
@@ -874,13 +959,13 @@
       function showFinish() {
         stepEl.hidden = true;
         finish.hidden = false;
-        // TODO: enviar { leadData, answers, qualified: true } pro banco quando integração estiver pronta.
+        persistQuiz(true);
       }
 
       function showDecline() {
         stepEl.hidden = true;
         decline.hidden = false;
-        // TODO: enviar { leadData, answers, qualified: false } pro banco quando integração estiver pronta.
+        persistQuiz(false);
       }
 
       form.addEventListener('submit', function (e) {
@@ -890,6 +975,9 @@
         if (!name.value.trim()) { name.focus(); return; }
         if (!email.value || !email.checkValidity()) { email.focus(); return; }
         leadData = { first_name: name.value.trim(), email: email.value.trim() };
+        // Evento Lead (pixel + CAPI), enriquecido com nome + e-mail. Fire-and-forget:
+        // o quiz abre na hora, sem esperar a rede.
+        fireEvent('Lead', false);
         form.style.display = 'none';
         openModal();
       });
@@ -904,6 +992,12 @@
         var picked = optsEl.querySelector('input[name="quizOption"]:checked');
         if (!picked) return;
         answers[current] = picked.value;
+        // Lead31Plus: pessoa com 31 anos ou mais. Dispara uma vez só (a flag impede
+        // re-disparo se ela voltar e avançar de novo na pergunta de idade).
+        if (current === AGE_QUESTION_INDEX && !lead31Fired && AGE_31_PLUS_BANDS.indexOf(picked.value) !== -1) {
+          lead31Fired = true;
+          fireEvent('Lead31Plus', true);
+        }
         if (current === EDUCATION_QUESTION_INDEX && picked.value !== QUALIFYING_EDUCATION) {
           showDecline();
           return;

@@ -5,3 +5,10 @@ dist/
 *.log
 .env
 .env.local
+
+# Tracking stack: local-only Cloudflare config & secrets (never commit).
+# Only wrangler.toml.example is tracked. Production D1 binding + env vars
+# are configured in the Cloudflare Pages dashboard, not in these files.
+wrangler.toml
+.dev.vars
+.dev.vars.*
