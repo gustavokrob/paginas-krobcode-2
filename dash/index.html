@@ -255,6 +255,36 @@
       </div>
     </section>
 
+    <!-- Leads /captura — qualificação -->
+    <section class="card p-5 fade-in">
+      <div class="flex items-center justify-between mb-3">
+        <div>
+          <div class="font-semibold">Leads /captura — qualificação</div>
+          <div class="text-xs text-[color:var(--muted)]">Quiz de pré-qualificação para a Comunidade KROB. Clique numa linha para ver todas as respostas.</div>
+        </div>
+        <div class="text-xs text-[color:var(--dim)]"><span id="captura-qualified" class="mono">—</span> qualificados</div>
+      </div>
+      <div id="captura-summary" class="flex flex-wrap gap-2 mb-3 text-xs"></div>
+      <div class="overflow-x-auto">
+        <table class="w-full text-sm">
+          <thead class="text-xs uppercase tracking-wider text-[color:var(--dim)] border-b border-[color:var(--border)]">
+            <tr>
+              <th class="text-left py-2 pr-4">When</th>
+              <th class="text-left py-2 pr-4">Email</th>
+              <th class="text-left py-2 pr-4">WhatsApp</th>
+              <th class="text-left py-2 pr-4">Perfil</th>
+              <th class="text-left py-2 pr-4">Tamanho</th>
+              <th class="text-left py-2 pr-4">Source</th>
+              <th class="text-center py-2">Qualificado</th>
+            </tr>
+          </thead>
+          <tbody id="captura-tbody">
+            <tr><td colspan="7" class="py-6 text-center text-[color:var(--muted)]">Loading…</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
     <!-- Recent purchases -->
     <section class="card p-5 fade-in">
       <div class="flex items-center justify-between mb-3">
@@ -522,6 +552,48 @@
     });
   }
 
+  function capturaProfileLabel(p) {
+    return ({ gestor: 'Gestor de tráfego', dono: 'Dono de negócio digital', equipe: 'Equipe interna', iniciante: 'Iniciante' })[p] || (p || '—');
+  }
+  function capturaSize(l) {
+    if (l.profile === 'gestor') return l.clients_band;
+    if (l.profile === 'dono')   return l.business_revenue_band;
+    return l.goal;
+  }
+
+  async function loadCapturaLeads(days) {
+    const data = await fetchJson(`/api/captura-leads?days=${days}&limit=100`);
+    qs('#captura-qualified').textContent = `${fmtInt(data.qualified)}/${fmtInt(data.total)}`;
+    qs('#captura-summary').innerHTML = (data.summary_by_profile || []).map(p => `
+      <span class="border border-[color:var(--border)] rounded-lg px-2 py-1">
+        <span class="mono font-semibold">${fmtInt(p.qualified)}/${fmtInt(p.count)}</span>
+        <span class="text-[color:var(--muted)] ml-1">${escapeHtml(capturaProfileLabel(p.profile))}</span>
+      </span>
+    `).join('');
+    const tbody = qs('#captura-tbody');
+    const rows = data.leads || [];
+    if (rows.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="7" class="py-6 text-center text-[color:var(--muted)]">Nenhuma resposta nesse período.</td></tr>';
+      return;
+    }
+    tbody.innerHTML = rows.map((l, i) => `
+      <tr class="row-hover border-b border-[color:var(--border)] cursor-pointer" data-idx="${i}">
+        <td class="py-2 pr-4 text-[color:var(--dim)]">${fmtDate(l.created_at)}</td>
+        <td class="py-2 pr-4 mono">${escapeHtml(l.raw_email || '—')}</td>
+        <td class="py-2 pr-4 mono">${escapeHtml(l.raw_phone || '—')}</td>
+        <td class="py-2 pr-4">${escapeHtml(capturaProfileLabel(l.profile))}</td>
+        <td class="py-2 pr-4 text-[color:var(--dim)]">${escapeHtml(capturaSize(l) || '—')}</td>
+        <td class="py-2 pr-4">${escapeHtml(l.utm_source || '(direct)')}</td>
+        <td class="py-2 text-center">${l.qualified ? '<span class="accent-green font-semibold">✓</span>' : '<span class="text-[color:var(--muted)]">—</span>'}</td>
+      </tr>
+    `).join('');
+    qsa('#captura-tbody tr[data-idx]').forEach(row => {
+      row.addEventListener('click', () => {
+        openDetails('captura', rows[parseInt(row.getAttribute('data-idx'), 10)]);
+      });
+    });
+  }
+
   async function loadPurchases() {
     const data = await fetchJson('/api/purchases?limit=50');
     const tbody = qs('#purchases-tbody');
@@ -561,6 +633,46 @@
     const title = qs('#modal-title');
     const subtitle = qs('#modal-subtitle');
     const body = qs('#modal-body');
+
+    if (kind === 'captura') {
+      title.textContent = 'Lead /captura — qualificação';
+      subtitle.textContent = `${fmtDate(row.created_at)} · ${row.raw_email || '(sem e-mail)'} · ${row.raw_phone || '(sem WhatsApp)'} · ${row.qualified ? 'QUALIFICADO' : 'não qualificado'}`;
+      const fields = [
+        ['Perfil', capturaProfileLabel(row.profile)],
+        ['Nº de clientes (gestor)', row.clients_band],
+        ['Faturamento de serviço (gestor)', row.service_revenue_band],
+        ['Faturamento do negócio (dono)', row.business_revenue_band],
+        ['Uso de tráfego pago (dono)', row.traffic_usage],
+        ['Verba de anúncios/mês', row.ad_spend_band],
+        ['Objetivo (equipe/iniciante)', row.goal],
+        ['Qualificado?', row.qualified ? 'Sim' : 'Não'],
+      ].filter(([, v]) => v != null && v !== '');
+      const attribution = [
+        ['utm_source', row.utm_source], ['utm_medium', row.utm_medium], ['utm_campaign', row.utm_campaign],
+        ['utm_content', row.utm_content], ['utm_term', row.utm_term],
+        ['fbclid', row.fbclid], ['gclid', row.gclid], ['referrer', row.referrer], ['landing_url', row.landing_url],
+      ].filter(([, v]) => v != null && v !== '');
+      const kv = (entries, mono) => entries.map(([k, v]) =>
+        `<div class="flex justify-between gap-4 border-b border-[color:var(--border)] py-1"><span class="text-[color:var(--dim)]">${escapeHtml(k)}</span><span class="${mono ? 'mono ' : ''}text-right break-all">${escapeHtml(v)}</span></div>`).join('');
+      body.innerHTML = `
+        <div>
+          <div class="font-semibold text-sm mb-2">Respostas</div>
+          <div class="text-sm">${kv(fields, false)}</div>
+        </div>
+        <div>
+          <div class="font-semibold text-sm mb-2">Atribuição (session)</div>
+          <div class="text-sm">${attribution.length ? kv(attribution, true) : '<div class="text-[color:var(--muted)]">— sem UTMs / clickids na session</div>'}</div>
+        </div>
+        <div>
+          <div class="font-semibold text-sm mb-2">answers_json (audit trail)</div>
+          <pre class="mono text-xs bg-[color:var(--bg)] border border-[color:var(--border)] rounded-lg p-3 overflow-x-auto whitespace-pre-wrap">${escapeHtml(formatJson(row.answers_json) || '—')}</pre>
+        </div>
+      `;
+      const m = qs('#details-modal');
+      m.classList.remove('hidden');
+      m.classList.add('flex');
+      return;
+    }
 
     if (kind === 'lead') {
       title.textContent = 'Lead details';
@@ -743,6 +855,7 @@
       loadAttribution(days),
       loadUtm(),
       loadLeads(days),
+      loadCapturaLeads(days),
       loadPurchases(),
       loadHealth(),
     ]);

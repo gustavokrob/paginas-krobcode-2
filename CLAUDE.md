@@ -20,8 +20,8 @@ Multi-page static site on Cloudflare Pages. Single domain, path-based routing.
 - `_headers` — cache rules. `/shared/*` cached for a year; HTML is not cached.
 - `.claude/commands/` — slash commands (e.g. `/new-page`).
 - `docs/` — architecture and onboarding docs (shareable). Tracking flow: `docs/TRACKING.md`.
-- `functions/` — Cloudflare Pages Functions (the tracking stack — see `## Tracking`). `_middleware.js` runs on every page; `tracker.js` is `POST /tracker`; `quiz-response.js` is `POST /quiz-response`; `api/*` are the read-only dashboard endpoints.
-- `migrations/` — D1 schema, applied with `wrangler d1 migrations apply`. Numbered `0001`–`0016` (`0005` intentionally absent).
+- `functions/` — Cloudflare Pages Functions (the tracking stack — see `## Tracking`). `_middleware.js` runs on every page; `tracker.js` is `POST /tracker`; `quiz-response.js` is `POST /quiz-response` (the `/lp-do-sobral` quiz); `captura-response.js` is `POST /captura-response` (the `/captura` qualification quiz); `api/*` are the read-only dashboard endpoints.
+- `migrations/` — D1 schema, applied with `wrangler d1 migrations apply`. Numbered `0001`–`0017` (`0005` intentionally absent).
 - `dash/` — the built-in tracking dashboard, served at `/dash/`. Auth via `?key=<DASH_KEY>`.
 - `wrangler.toml.example` — template for the local-only `wrangler.toml` (gitignored). See `## Tracking` → deploy.
 
@@ -45,17 +45,31 @@ same-origin with the landing pages.
 and upserts a `sessions` row. `POST /tracker` (`functions/tracker.js`) fires server-side conversion
 events to Meta CAPI (with SHA-256-hashed PII for Advanced Matching), deduped against the browser pixel
 by `event_id`, and logs non-PageView events to `event_log`. `POST /quiz-response`
-(`functions/quiz-response.js`) persists the `/lp-do-sobral` qualification-quiz answers to `quiz_responses`.
-The dashboard lives at `/dash/?key=<DASH_KEY>` (Leads + Tracking Health tabs are the live ones; the
-revenue/products/attribution tabs are wired but empty — no sales funnel here).
+(`functions/quiz-response.js`) persists the `/lp-do-sobral` qualification-quiz answers to `quiz_responses`;
+`POST /captura-response` (`functions/captura-response.js`) persists the `/captura` qualification-quiz
+answers to `captura_responses`. The dashboard lives at `/dash/?key=<DASH_KEY>` (Leads, "Leads /captura
+— qualificação", and Tracking Health are the live sections; the revenue/products/attribution sections
+are wired but empty — no sales funnel here).
 
 **Events `/lp-do-sobral` fires:** `PageView` (pixel + CAPI, never logged to D1) on load; `Lead`
 (enriched with `em` + `fn`) on form submit; the custom event `Lead31Plus` (also `em` + `fn`) when the
 visitor picks a 31-or-older age band on the quiz's first question; and `POST /quiz-response` at the end
-of the quiz. Other pages (`/captura`, `/vendas`, `/links`) get cookie + `sessions` capture for free via
-the middleware but don't fire pixel events. Sales-side tracking (`/checkout-session`, sales-platform
-webhooks) was deliberately **not** ported — if `/vendas` ever becomes a real checkout page, port the
-sales-page recipe from the source stack.
+of the quiz.
+
+**Events `/captura` fires:** `PageView` (pixel + CAPI, never logged) on load; `Lead` (enriched with
+`em`) on email submit; the custom event `LeadQualificado` (`em`) the moment the post-signup quiz answers
+match the Comunidade KROB ICP — gestor de tráfego with 3+ different clients, **or** dono de negócio
+digital billing R$ 10k+/mês who actually runs paid traffic; and `POST /captura-response` at the end of
+the quiz (answers + `qualified` flag → `captura_responses`, joinable to `sessions` for UTMs; surfaced
+in the dashboard's "Leads /captura" section via `functions/api/captura-leads.js`). The quiz branches by
+profile (gestor / dono / equipe interna / iniciante) — the answer strings and qualification thresholds
+are constants at the top of the IIFE in `captura/index.html`. In Meta Ads, build a custom conversion on
+the `LeadQualificado` event.
+
+Other pages (`/vendas`, `/links`) get cookie + `sessions` capture for free via the middleware but don't
+fire pixel events. Sales-side tracking (`/checkout-session`, sales-platform webhooks) was deliberately
+**not** ported — if `/vendas` ever becomes a real checkout page, port the sales-page recipe from the
+source stack.
 
 **GA4 is off.** Meta only. The gtag first-party proxy and GA4 script blocks were not ported. To turn GA4
 on later: set `GA4_MEASUREMENT_ID` + `GA4_API_SECRET`, copy `functions/scripts/[[path]].js` from the
@@ -67,8 +81,8 @@ cleanly when those env vars are unset.
   Enforced in `tracker.js`.
 - **Always use parameterized SQL** (`.bind()`). No string interpolation of user input, ever.
 - **Hash PII before sending to ad platforms.** Email/name get SHA-256-hashed after lowercase+trim
-  in `tracker.js`. Raw PII persists in D1 (`event_log.raw_email`, `quiz_responses.raw_*`) for analysis
-  only — it never leaves this infra.
+  in `tracker.js`. Raw PII persists in D1 (`event_log.raw_email`, `quiz_responses.raw_*`,
+  `captura_responses.raw_email`/`raw_phone`) for analysis only — it never leaves this infra.
 - **No secrets in client code or git.** `wrangler.toml`, `.dev.vars*` are gitignored. The Meta CAPI
   token and `DASH_KEY` live only as Cloudflare Pages environment variables.
 
