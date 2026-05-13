@@ -13,6 +13,39 @@
 
   <link rel="preload" as="image" href="/vendas/assets/hero.webp">
 
+  <!-- Meta Pixel — preconnect first-party + loader. O CAPI server-side roda via /tracker
+       (functions/tracker.js); o token e o Pixel ID ficam na env var do Pages. O número
+       no fbq('init') abaixo precisa ser igual ao da env var META_PIXEL_ID. -->
+  <link rel="preconnect" href="https://connect.facebook.net" crossorigin>
+  <script>
+    !function(f,b,e,v,n,t,s){if(f.fbq)return;n=f.fbq=function(){n.callMethod?
+    n.callMethod.apply(n,arguments):n.queue.push(arguments)};if(!f._fbq)f._fbq=n;
+    n.push=n;n.loaded=!0;n.version='2.0';n.queue=[];t=b.createElement(e);t.async=!0;
+    t.src=v;s=b.getElementsByTagName(e)[0];s.parentNode.insertBefore(t,s)}(window,
+    document,'script','https://connect.facebook.net/en_US/fbevents.js');
+    fbq('init', '945469125060300');
+
+    // PageView — dual fire (pixel + CAPI) com event_id compartilhado para dedup.
+    // /tracker NÃO grava PageView em event_log; só dispara o Meta CAPI server-side.
+    (function () {
+      var pvEventId = (crypto.randomUUID && crypto.randomUUID()) ||
+        (Date.now() + '-' + Math.random().toString(36).slice(2));
+      fbq('track', 'PageView', {}, { eventID: pvEventId });
+      fetch('/tracker', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        keepalive: true,
+        body: JSON.stringify({
+          event_name: 'PageView',
+          event_id: pvEventId,
+          event_time: Math.floor(Date.now() / 1000),
+          event_source_url: window.location.href,
+          user_data: {},
+        }),
+      }).catch(function () {});
+    })();
+  </script>
+
   <style>
     *,*::before,*::after { box-sizing: border-box; }
 
@@ -623,7 +656,7 @@
               <span class="interval">à vista · ou 12× R$ 49,70</span>
             </div>
 
-            <a class="btn btn-primary btn-lg" href="#">
+            <a id="checkout-btn" class="btn btn-primary btn-lg" href="#">
               Quero me inscrever
               <svg viewBox="0 0 16 16" fill="none" aria-hidden="true">
                 <path d="M6 3l5 5-5 5" stroke="currentColor" stroke-width="1.75" stroke-linecap="round" stroke-linejoin="round"/>
@@ -717,6 +750,133 @@
       &copy; 2026 Lorem Ipsum · Todos os direitos reservados
     </div>
   </footer>
+
+  <!-- Checkout funnel — InitiateCheckout (pixel + CAPI) no clique do botão de preço,
+       depois redireciona pro Hotmart com xcod=<trk> pra fechar o loop quando o
+       PURCHASE_APPROVED chegar em /webhook/hotmart/<HOTMART_WEBHOOK_SLUG>. Ver
+       CLAUDE.md → seção ## Tracking e funções em functions/checkout-session.js,
+       functions/webhook/hotmart/[slug].js, functions/webhook/_core.js. -->
+  <script defer>
+  (function () {
+    'use strict';
+
+    // Hotmart product link — pay.hotmart.com/<ucode>?off=<offer>. xcod e sck são
+    // appendados ao clicar; xcod transporta o trk de volta no webhook (campo
+    // data.purchase.origin.xcod), sck carrega as UTMs como pipe-bundle quando
+    // existem (o Hotmart não forwarda utm_* nativamente).
+    var CHECKOUT_URL = 'https://pay.hotmart.com/X97540270M?off=rv7lryct';
+
+    // Pixel custom_data — o Purchase real (do webhook) vem com o value que o
+    // cliente pagou de fato; aqui no InitiateCheckout passamos só identidade
+    // do produto. Manter o ID alinhado com o product.id que o Hotmart entrega
+    // (numérico, 4959432 = TrackStart).
+    var CONTENT_IDS = ['4959432'];
+    var CONTENT_NAME = 'TrackStart — API de conversões pelo Google Tag Manager';
+
+    // trk: UUID v4 gerado uma vez por aba do navegador (sobrevive a refreshes
+    // dentro da mesma session). Se o visitante volta dias depois, ganha um trk
+    // novo — desejado, é uma nova "intenção de compra".
+    var STORAGE_KEY = 'krob_trk';
+    var trk = '';
+    try { trk = sessionStorage.getItem(STORAGE_KEY) || ''; } catch (_) {}
+    if (!trk) {
+      trk = (crypto.randomUUID && crypto.randomUUID()) ||
+        (Date.now() + '-' + Math.random().toString(36).slice(2));
+      try { sessionStorage.setItem(STORAGE_KEY, trk); } catch (_) {}
+    }
+
+    // UTMs da URL atual — o edge middleware já gravou em `sessions`, mas
+    // passamos no POST defensivamente (pega o caso raro de cookie bloqueado).
+    var p = new URLSearchParams(window.location.search);
+    var utmSource   = p.get('utm_source')   || '';
+    var utmMedium   = p.get('utm_medium')   || '';
+    var utmCampaign = p.get('utm_campaign') || '';
+    var utmContent  = p.get('utm_content')  || '';
+    var utmTerm     = p.get('utm_term')     || '';
+
+    // Snapshot da atribuição em checkout_sessions (D1), indexado por trk.
+    // Roda uma vez por carregamento — `INSERT OR REPLACE` no servidor garante
+    // que múltiplas chamadas não duplicam.
+    fetch('/checkout-session', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      keepalive: true,
+      body: JSON.stringify({
+        trk: trk,
+        utm_source: utmSource,
+        utm_medium: utmMedium,
+        utm_campaign: utmCampaign,
+        utm_content: utmContent,
+        utm_term: utmTerm,
+        event_source_url: window.location.href,
+      }),
+    }).catch(function () {});
+
+    // InitiateCheckout — dual fire (pixel + CAPI via sendBeacon) com event_id
+    // compartilhado pra Meta deduplicar. sendBeacon sobrevive à navegação pro
+    // Hotmart, o que `fetch` com `keepalive` faz só "best effort".
+    function fireInitiateCheckout() {
+      var eventId = (crypto.randomUUID && crypto.randomUUID()) ||
+        (Date.now() + '-' + Math.random().toString(36).slice(2));
+      var eventTime = Math.floor(Date.now() / 1000);
+      var customData = {
+        content_type: 'product',
+        content_ids: CONTENT_IDS,
+        content_name: CONTENT_NAME,
+      };
+
+      try {
+        if (window.fbq) {
+          fbq('track', 'InitiateCheckout', customData, { eventID: eventId });
+        }
+      } catch (_) {}
+
+      try {
+        var payload = JSON.stringify({
+          event_name: 'InitiateCheckout',
+          event_id: eventId,
+          event_time: eventTime,
+          event_source_url: window.location.href,
+          user_data: {},
+          custom_data: customData,
+        });
+        navigator.sendBeacon('/tracker',
+          new Blob([payload], { type: 'application/json' }));
+      } catch (_) {}
+    }
+
+    // Só o CTA da price-card vira "Comprar". Os outros CTAs (hero + final)
+    // são scroll-to-#preco; isso preserva o funil natural (visitante decide
+    // rolar e escolher o preço antes de comprometer-se com o checkout).
+    var btn = document.getElementById('checkout-btn');
+    if (btn) {
+      btn.addEventListener('click', function (e) {
+        e.preventDefault();
+        fireInitiateCheckout();
+
+        var qs = new URLSearchParams();
+        qs.set('xcod', trk);
+
+        // UTMs viram um pipe-bundle no campo `sck` (URL-encoded por parte).
+        // O adapter em functions/webhook/hotmart/[slug].js distingue isso da
+        // enum nativa do Hotmart (sem `|`) e remonta o objeto utm_*.
+        if (utmSource || utmMedium || utmCampaign || utmContent || utmTerm) {
+          var sckBundle = [utmSource, utmMedium, utmCampaign, utmContent, utmTerm]
+            .map(encodeURIComponent)
+            .join('|');
+          qs.set('sck', sckBundle);
+        }
+
+        var sep = CHECKOUT_URL.indexOf('?') >= 0 ? '&' : '?';
+        var destination = CHECKOUT_URL + sep + qs.toString();
+
+        // 80ms é o tempo que browsers lentos (Android Chrome especialmente)
+        // levam pra flushear o sendBeacon antes de descarregar a página.
+        setTimeout(function () { window.location.href = destination; }, 80);
+      });
+    }
+  })();
+  </script>
 
 </body>
 </html>

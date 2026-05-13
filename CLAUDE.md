@@ -36,9 +36,9 @@ Multi-page static site on Cloudflare Pages. Single domain, path-based routing.
 ## Tracking
 
 This repo has the **KROB tracking stack** merged in (ported from `gustavokrob/krob-tracking-stack`,
-leads-funnel slice only). It's part of the **same** Cloudflare Pages project that serves the pages —
-do not split it into a separate project; the first-party cookies + edge middleware only work
-same-origin with the landing pages.
+leads funnel + Hotmart sales funnel). It's part of the **same** Cloudflare Pages project that serves
+the pages — do not split it into a separate project; the first-party cookies + edge middleware only
+work same-origin with the landing pages.
 
 **What it does:** the edge middleware (`functions/_middleware.js`) runs on every page request, sets
 400-day first-party cookies (`_krob_sid`, `_fbp`, `_fbc`, `_krob_eid`), captures `fbclid`/`gclid`/UTMs,
@@ -47,9 +47,13 @@ events to Meta CAPI (with SHA-256-hashed PII for Advanced Matching), deduped aga
 by `event_id`, and logs non-PageView events to `event_log`. `POST /quiz-response`
 (`functions/quiz-response.js`) persists the `/lp-do-sobral` qualification-quiz answers to `quiz_responses`;
 `POST /captura-response` (`functions/captura-response.js`) persists the `/captura` qualification-quiz
-answers to `captura_responses`. The dashboard lives at `/dash/?key=<DASH_KEY>` (Leads, "Leads /captura
-— qualificação", and Tracking Health are the live sections; the revenue/products/attribution sections
-are wired but empty — no sales funnel here).
+answers to `captura_responses`. `POST /checkout-session` (`functions/checkout-session.js`) snapshots
+fbp/fbc/UTMs/IP/UA into `checkout_sessions` (indexed by `trk` UUID) when the visitor opens `/vendas` —
+so when `POST /webhook/hotmart/<HOTMART_WEBHOOK_SLUG>` (`functions/webhook/hotmart/[slug].js`) receives
+the Hotmart Postback 2.0 later, the shared core (`functions/webhook/_core.js`) can recover that
+attribution by `trk` and fire `Purchase` to Meta CAPI with full user_data + write the sale to
+`purchase_log` + `purchase_items`. The dashboard lives at `/dash/?key=<DASH_KEY>` (Leads, "Leads /captura
+— qualificação", Tracking Health, Revenue, and Recent purchases are all live sections).
 
 **Events `/lp-do-sobral` fires:** `PageView` (pixel + CAPI, never logged to D1) on load; `Lead`
 (enriched with `em` + `fn`) on form submit; the custom event `Lead31Plus` (also `em` + `fn`) when the
@@ -66,10 +70,23 @@ profile (gestor / dono / equipe interna / iniciante) — the answer strings and 
 are constants at the top of the IIFE in `captura/index.html`. In Meta Ads, build a custom conversion on
 the `LeadQualificado` event.
 
-Other pages (`/vendas`, `/links`) get cookie + `sessions` capture for free via the middleware but don't
-fire pixel events. Sales-side tracking (`/checkout-session`, sales-platform webhooks) was deliberately
-**not** ported — if `/vendas` ever becomes a real checkout page, port the sales-page recipe from the
-source stack.
+**Events `/vendas` fires:** `PageView` (pixel + CAPI, never logged) on load; `InitiateCheckout`
+(pixel + CAPI, with `content_type='product'` + `content_ids: ['4959432']` + `content_name:
+'TrackStart — API de conversões pelo Google Tag Manager'`) when the price-card CTA is clicked;
+`POST /checkout-session` on load to snapshot fbp/fbc/UTMs into `checkout_sessions` keyed by a
+sessionStorage `trk` UUID. The button then redirects to
+`https://pay.hotmart.com/X97540270M?off=rv7lryct&xcod=<trk>&sck=<utm-bundle>` — Hotmart carries the
+`trk` back in the webhook as `data.purchase.origin.xcod`. The `Purchase` event is fired exclusively
+**server-side** via `POST /webhook/hotmart/<HOTMART_WEBHOOK_SLUG>` on `PURCHASE_APPROVED` (refunds /
+chargebacks are acknowledged with 200 and skipped) — there is NO Purchase pixel event from
+`pay.hotmart.com` because that's a different origin and our Pixel doesn't run there. The webhook
+adapter is in `functions/webhook/hotmart/[slug].js`; common processing (D1 lookup of
+`checkout_sessions`, Meta CAPI fire, `purchase_log`/`purchase_items` insert with rollback invariant)
+lives in `functions/webhook/_core.js`. URL-slug auth via `functions/webhook/_utils.js:guardSlug`
+(404 on bad slug — scanner-resistant; HOTTOK / HMAC validation deliberately deferred).
+
+Other pages (`/links`) get cookie + `sessions` capture for free via the middleware but don't fire
+pixel events.
 
 **GA4 is off.** Meta only. The gtag first-party proxy and GA4 script blocks were not ported. To turn GA4
 on later: set `GA4_MEASUREMENT_ID` + `GA4_API_SECRET`, copy `functions/scripts/[[path]].js` from the
@@ -88,10 +105,14 @@ cleanly when those env vars are unset.
 
 **Required Pages environment variables** (Settings → Environment variables → Production):
 `META_PIXEL_ID` (numeric — same value used in the page's `fbq('init', ...)`), `META_ACCESS_TOKEN` (CAPI
-token, encrypt), `DASH_KEY` (random, encrypt — gates `/dash` and `/api/*`). Optional: `META_TEST_EVENT_CODE`
-(routes events to Events Manager → Test Events), `DEFAULT_COUNTRY_CODE` (default `55`), and
-`SYNC_SECRET` + `META_ADS_ACCESS_TOKEN` + `META_ADS_ACCOUNT_ID` (Meta-spend sync — inactive until set
-and an external hourly cron hits `/api/sync/meta-ads`).
+token, encrypt), `DASH_KEY` (random, encrypt — gates `/dash` and `/api/*`), `HOTMART_WEBHOOK_SLUG`
+(UUID v4, encrypt — gates `/webhook/hotmart/<slug>`; generate with `uuidgen` or
+`openssl rand -hex 16` reformatted as a UUID; the URL `https://<your-domain>/webhook/hotmart/<slug>`
+goes into the Hotmart panel under Ferramentas → Webhook (Postback 2.0), event `PURCHASE_APPROVED`).
+Optional: `META_TEST_EVENT_CODE` (routes events to Events Manager → Test Events),
+`DEFAULT_COUNTRY_CODE` (default `55`), and `SYNC_SECRET` + `META_ADS_ACCESS_TOKEN` +
+`META_ADS_ACCOUNT_ID` (Meta-spend sync — inactive until set and an external hourly cron hits
+`/api/sync/meta-ads`).
 **Required D1 binding:** a D1 database bound as variable name `DB` (the code reads `env.DB`).
 
 **Deploy / D1 setup** (run with `cf-on borkcursos`): `npx wrangler@latest d1 create <name>-db` →
