@@ -19,9 +19,14 @@
 //     never contain pipes.
 //   - Hotmart pre-splits buyer name into `first_name` + `last_name`; use those
 //     directly instead of re-splitting `name`.
-//   - No phone field on the buyer by default. `body.buyer` has `email`,
-//     `name`, `first_name`, `last_name`, `document`, `address` — no
-//     `mobile` / `phone` / `checkout_phone`.
+//   - Phone arrives as `data.buyer.checkout_phone` when the offer's checkout
+//     collects it (Brazilian format: DDD + 9-digit local, e.g. "53981048894").
+//     The companion `data.buyer.checkout_phone_code` is unreliable — Hotmart's
+//     checkout UI sometimes stores the DDD there (duplicating what's already
+//     in checkout_phone), sometimes the country dial code, and we can't
+//     safely distinguish, so ignore it and let _core.js:normalizePhone()
+//     prepend DEFAULT_COUNTRY_CODE (55) when the number doesn't already start
+//     with a country code.
 //   - Paid event: `rawPayload.event === 'PURCHASE_APPROVED'` combined with
 //     `data.purchase.status === 'APPROVED'`. Hotmart fires other events
 //     (PURCHASE_COMPLETE, PURCHASE_REFUNDED, etc.) — acknowledge-and-skip.
@@ -74,9 +79,11 @@ export async function onRequestPost(context) {
       trk: purchase.origin?.xcod || '',
       email: buyer.email || '',
       name: fullName,
-      // Hotmart doesn't surface phone on the default PURCHASE_APPROVED
-      // payload; leave empty.
-      phone: '',
+      // checkout_phone is the full national number with DDD when the offer
+      // collects phone; normalizePhone() in _core.js prepends country code
+      // (55 by default) if missing. Ignore checkout_phone_code — see the
+      // platform-specifics block at the top of the file.
+      phone: buyer.checkout_phone || '',
       value: parseFloat(price.value) || 0,
       currency: price.currency_value || 'BRL',
       transactionId: purchase.transaction || '',
